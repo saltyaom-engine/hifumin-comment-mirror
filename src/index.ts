@@ -1,162 +1,226 @@
-import { mkdirSync, existsSync, writeFileSync } from 'fs'
+import { mkdirSync, existsSync, writeFileSync, appendFileSync } from 'fs'
+import { writeFile, appendFile } from 'fs/promises'
+
+import type { Browser, Page } from 'puppeteer'
+import puppeteer from 'puppeteer-extra'
+import Stealth from 'puppeteer-extra-plugin-stealth'
 
 import PQueue from 'p-queue'
-import fetch from 'isomorphic-unfetch'
 import parse from 'node-html-parser'
 
-// NHentai Rate limit
+puppeteer.use(Stealth())
 const queue = new PQueue({ concurrency: 6 })
 
-// ? Get estimate latest nhentai id
-const getLatest = async (): Promise<number | Error> => {
-  const html = await fetch('https://nhentai.net')
-    .then((res) => res.text())
-    .then((res) => parse(res))
+const currentWorker = +(process.env?.WORKER_INDEX ?? 1)
+const searchable = `data/searchable${currentWorker}.json`
 
-  const firstCover = html.querySelector(
-    '#content > .index-container:nth-child(3) > .gallery > .cover'
-  )
+const getLatest = async (
+    browser: Browser,
+    iteration = 0
+): Promise<number | Error> => {
+    const page = await browser.newPage()
+    await page.goto('https://nhentai.net', {
+        waitUntil: 'networkidle2'
+    })
 
-  if (!firstCover) throw new Error("Couldn't find first cover")
+    try {
+        const firstCover = (
+            await page.waitForSelector(
+                '#content > .index-container:nth-child(3) > .gallery > .cover',
+                {
+                    timeout: 10000
+                }
+            )
+        )?.asElement()
+        if (!firstCover) throw new Error("Couldn't find first cover")
 
-  const url = firstCover.getAttribute('href')!
+        const url = await firstCover.getProperty('href')
 
-  const id = url
-    .split('/')
-    .reverse()
-    .find((x) => x)
+        const id = url
+            .toString()
+            .split('/')
+            .reverse()
+            .find((x) => x)
 
-  return id ? parseInt(id) : new Error("Couldn't find id")
+        await new Promise((resolve) => setTimeout(resolve, 3000))
+
+        await page.close()
+        return id ? parseInt(id) : new Error("Couldn't find id")
+    } catch (err) {
+        if (iteration < 3) {
+            await new Promise((resolve) => setTimeout(resolve, 3000))
+
+            return getLatest(browser, iteration + 1)
+        }
+
+        console.log(await page.content())
+        return new Error('Unable to bypass Cloudflare')
+    }
 }
 
 const getNhentai = async (
-  id: number,
-  iteration = 0
+    browser: Browser,
+    id: number,
+    iteration = 0
 ): Promise<string | Error> => {
-  try {
-    const hentai: string = await fetch(
-      `https://nhentai.net/api/gallery/${id}/comments`
-    ).then((res) => res.text())
+    const page = await browser.newPage()
+    if (iteration > 1) await page.setJavaScriptEnabled(true)
 
-    if (hentai === "[]") return "[]"
-    if (!hentai.startsWith('[{"id"')) return new Error('Not found')
+    try {
+        await page.goto(`https://nhentai.net/api/gallery/${id}/comments`, {
+            waitUntil: 'networkidle2'
+        })
 
-    return hentai
-  } catch (err) {
-    if (iteration <= 5) {
-      await new Promise((resolve) => setTimeout(resolve, 8000))
+        await page.waitForSelector('body > pre', {
+            timeout: iteration === 0 ? 2500 : 7500
+        })
 
-      return getNhentai(id, iteration + 1)
+        const hentai = await page.$eval('body > pre', (el) => el.innerHTML)
+        if (hentai === '[]') return '[]'
+        if (!hentai.startsWith('[{"id"')) return new Error('Not found')
+
+        return hentai
+    } catch (err) {
+        if (iteration < 3) {
+            await new Promise((resolve) => setTimeout(resolve, 5000))
+
+            return getNhentai(browser, id, iteration + 1)
+        }
+
+        return new Error("Couldn't fetch hentai")
+    } finally {
+        await page.close()
     }
-
-    return new Error("Couldn't fetch hentai")
-  }
 }
 
 const estimateTime = ({
-  since,
-  current,
-  total
+    since,
+    current,
+    total
 }: {
-  since: number
-  current: number
-  total: number
+    since: number
+    current: number
+    total: number
 }) => (((performance.now() - since) / current) * (total - current)) / 1000
 
 const formatDisplayTime = (time: number) => {
-  let seconds = ~~time
-  let minutes = 0
-  let hours = 0
+    let seconds = ~~time
+    let minutes = 0
+    let hours = 0
 
-  while (seconds >= 3600) {
-    seconds -= 3600
-    hours += 1
-  }
+    while (seconds >= 3600) {
+        seconds -= 3600
+        hours += 1
+    }
 
-  while (seconds >= 60) {
-    seconds -= 60
-    minutes += 1
-  }
+    while (seconds >= 60) {
+        seconds -= 60
+        minutes += 1
+    }
 
-  if (hours) return `${hours}h ${minutes}m ${seconds}s`
+    if (hours) return `${hours}h ${minutes}m ${seconds}s`
+    if (minutes) return `${minutes}m ${seconds}s`
 
-  if (minutes) return `${minutes}m ${seconds}s`
-
-  return `${seconds}s`
+    return `${seconds}s`
 }
 
-const batch = (
-  total: number,
-  batch: number = +(process.env?.WORKER_INDEX ?? 1)
-) => {
-  const totalWorker = +(process.env?.WORKER_COUNT ?? 1)
+const batch = (total: number, batch: number = currentWorker) => {
+    const totalWorker = +(process.env?.WORKER_COUNT ?? 1)
 
-  const start = Math.floor(((batch - 1) * total) / totalWorker + 1)
-  const end = Math.floor((batch * total) / totalWorker)
+    const start = Math.floor(((batch - 1) * total) / totalWorker + 1)
+    const end = Math.floor((batch * total) / totalWorker)
 
-  return { start, end }
+    return { start, end }
 }
 
 const main = async () => {
-  const total = await getLatest()
+    const browser = (await puppeteer.launch({
+        headless: false,
+        args: ['--no-sandbox'],
+        executablePath: process.env.PUPPETEER_EXEC_PATH
+    })) as unknown as Browser
 
-  if (total instanceof Error) {
-    console.error(total.message)
-    process.exit(1)
-  }
+    let total = await getLatest(browser)
 
-  const { start, end } = batch(total)
-  console.log(`${total} total, worker: ${start} - ${end}`)
+    if (total instanceof Error) {
+        console.error(total.message)
+        process.exit(1)
+    }
 
-  if (!existsSync('data')) mkdirSync('data')
+    total = 50
 
-  const since = performance.now()
+    const { start, end } = batch(total)
+    console.log(`${total} total, worker: ${start} - ${end}`)
 
-  let current = start
-  let iteration = 1
+    if (!existsSync('data')) mkdirSync('data')
 
-  for (let i = start; i <= end; i++) {
-    queue.add(async () => {
-      const hentai = await getNhentai(i)
+    const since = performance.now()
 
-      current++
-      iteration++
+    const latestHentai = await getNhentai(browser, total)
+    if (latestHentai instanceof Error) {
+        console.error("Can't get latest hentai")
+        process.exit(1)
+    }
 
-      if (hentai instanceof Error) {
-        console.log(`${i} not found`)
-        return
-      }
+    await Promise.all([
+        writeFile(`data/latest_id.txt`, total.toString()),
+        writeFile(`data/latest.json`, latestHentai)
+    ])
 
-      writeFileSync(`data/${i}.json`, hentai)
-    })
+    let current = start
+    let iteration = 1
 
-    // For GH Action use 1.25s, local use 0.625s
-    queue.add(() => new Promise((resolve) => setTimeout(resolve, 1250)))
-  }
+    for (let i = start; i <= end; i++)
+        queue.add(async () => {
+            const hentai = await getNhentai(browser, i)
 
-  const progress = setInterval(() => {
-    console.log(
-      `(${((iteration / (end - start)) * 100).toFixed(
-        4
-      )}%) | ${current}/${end} | Estimate time left: ${formatDisplayTime(
-        estimateTime({
-          current: iteration,
-          total: end - start,
-          since
+            current++
+            iteration++
+
+            if (hentai instanceof Error) return console.log(`${i} not found`)
+
+            await Promise.all([
+                writeFile(`data/${i}.json`, hentai),
+                new Promise((resolve) => setTimeout(resolve, 500))
+            ])
         })
-      )}`
+
+    let latestProgress = 0
+
+    const progress = setInterval(async () => {
+        if (latestProgress === iteration) {
+            appendFileSync(searchable, ']')
+
+            await browser.close()
+            return process.exit(0)
+        }
+
+        latestProgress = iteration
+
+        console.log(
+            `(${((iteration / (end - start)) * 100).toFixed(
+                4
+            )}%) | ${current}/${end} | Estimate time left: ${formatDisplayTime(
+                estimateTime({
+                    current: iteration,
+                    total: end - start,
+                    since
+                })
+            )}`
+        )
+    }, 10000)
+
+    await queue.onIdle()
+
+    clearInterval(progress)
+
+    console.log(
+        'Done in',
+        ((performance.now() - since) / 1000).toFixed(3),
+        'seconds'
     )
-  }, 10000)
 
-  await queue.onIdle()
-
-  clearInterval(progress)
-
-  console.log(
-    'Done in',
-    ((performance.now() - since) / 1000).toFixed(3),
-    'seconds'
-  )
+    await browser.close()
 }
 
 main()
