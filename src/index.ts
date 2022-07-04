@@ -24,28 +24,30 @@ const getLatest = async (
     })
 
     try {
-        const firstCover = (
-            await page.waitForSelector(
-                '#content > .index-container:nth-child(3) > .gallery > .cover',
-                {
-                    timeout: 10000
-                }
-            )
-        )?.asElement()
-        if (!firstCover) throw new Error("Couldn't find first cover")
+        return 100
 
-        const url = await firstCover.getProperty('href')
+        // const firstCover = (
+        //     await page.waitForSelector(
+        //         '#content > .index-container:nth-child(3) > .gallery > .cover',
+        //         {
+        //             timeout: 10000
+        //         }
+        //     )
+        // )?.asElement()
+        // if (!firstCover) throw new Error("Couldn't find first cover")
 
-        const id = url
-            .toString()
-            .split('/')
-            .reverse()
-            .find((x) => x)
+        // const url = await firstCover.getProperty('href')
 
-        await new Promise((resolve) => setTimeout(resolve, 3000))
+        // const id = url
+        //     .toString()
+        //     .split('/')
+        //     .reverse()
+        //     .find((x) => x)
 
-        await page.close()
-        return id ? parseInt(id) : new Error("Couldn't find id")
+        // await new Promise((resolve) => setTimeout(resolve, 3000))
+
+        // await page.close()
+        // return id ? parseInt(id) : new Error("Couldn't find id")
     } catch (err) {
         if (iteration < 3) {
             await new Promise((resolve) => setTimeout(resolve, 3000))
@@ -58,7 +60,7 @@ const getLatest = async (
     }
 }
 
-const getNhentai = async (
+const getComment = async (
     browser: Browser,
     id: number,
     iteration = 0
@@ -84,7 +86,41 @@ const getNhentai = async (
         if (iteration < 3) {
             await new Promise((resolve) => setTimeout(resolve, 5000))
 
-            return getNhentai(browser, id, iteration + 1)
+            return getComment(browser, id, iteration + 1)
+        }
+
+        return new Error("Couldn't fetch hentai")
+    } finally {
+        await page.close()
+    }
+}
+
+const getRelated = async (
+    browser: Browser,
+    id: number,
+    iteration = 0
+): Promise<string | Error> => {
+    const page = await browser.newPage()
+    if (iteration > 1) await page.setJavaScriptEnabled(true)
+
+    try {
+        await page.goto(`https://nhentai.net/api/gallery/${id}/related`, {
+            waitUntil: 'networkidle2'
+        })
+
+        await page.waitForSelector('body > pre', {
+            timeout: iteration === 0 ? 2500 : 7500
+        })
+
+        const hentai = await page.$eval('body > pre', (el) => el.innerHTML)
+        if (!hentai.startsWith('{"result":[{')) return new Error('Not found')
+
+        return hentai
+    } catch (err) {
+        if (iteration < 3) {
+            await new Promise((resolve) => setTimeout(resolve, 5000))
+
+            return getRelated(browser, id, iteration + 1)
         }
 
         return new Error("Couldn't fetch hentai")
@@ -154,7 +190,7 @@ const main = async () => {
 
     const since = performance.now()
 
-    const latestHentai = await getNhentai(browser, total)
+    const latestHentai = await getComment(browser, total)
     if (latestHentai instanceof Error) {
         console.error("Can't get latest hentai")
         process.exit(1)
@@ -170,15 +206,21 @@ const main = async () => {
 
     for (let i = start; i <= end; i++)
         queue.add(async () => {
-            const hentai = await getNhentai(browser, i)
+            const comment = await getComment(browser, i)
 
             current++
             iteration++
 
-            if (hentai instanceof Error) return console.log(`${i} not found`)
+            if (comment instanceof Error) return console.log(`Comment: ${i} not found`)
+
+            await new Promise((resolve) => setTimeout(resolve, 500))
+
+            const related = await getRelated(browser, i)
+            if (related instanceof Error) return console.log(`Related: ${i} not found`)
 
             await Promise.all([
-                writeFile(`data/${i}.json`, hentai),
+                writeFile(`data/${i}.json`, comment),
+                writeFile(`data/${i}-related.json`, comment),
                 new Promise((resolve) => setTimeout(resolve, 500))
             ])
         })
