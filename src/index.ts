@@ -218,7 +218,7 @@ const main = async () => {
 
             await Promise.all([
                 writeFile(`data/${i}.json`, comment),
-                writeFile(`data/${i}-related.json`, comment),
+                writeFile(`data/${i}-related.json`, related),
                 new Promise((resolve) => setTimeout(resolve, 500))
             ])
         })
